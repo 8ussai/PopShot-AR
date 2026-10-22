@@ -1,106 +1,181 @@
-import cv2
 import os
+import sys
 import time
+
+import cv2
 import pygame
-import numpy as np
-from hand_detector import HandDetector
-from enemy import Enemy
+
 import config
 import database
-import scoreboard_gui
+from enemy import Enemy
+from hand_detector import HandDetector
+from scoreboard_gui import Scoreboard
+from utils import draw_text, load_image, overlay_image
+
+KEY_ESC, KEY_ENTER, KEY_BACKSPACE = 27, 13, 8
+MAX_FAILED_READS = 30
+
+PLAYING, LOST, ENTER_NAME = "playing", "lost", "enter_name"
 
 
-pygame.mixer.init()
-pop_sound = pygame.mixer.Sound(config.POP_SOUND)
+def load_sound():
+    try:
+        pygame.mixer.init()
+        return pygame.mixer.Sound(config.POP_SOUND)
+    except pygame.error as e:
+        print(f"Sound disabled: {e}")
+        return None
 
-finger_img = cv2.imread(config.FINGER_IMAGE, cv2.IMREAD_UNCHANGED)
-finger_img = cv2.resize(finger_img, (120, 120))
 
-enemy_images = []
-for filename in os.listdir(config.ENEMY_FOLDER):
-    if filename.lower().endswith((".png", ".jpg")):
-        path = os.path.join(config.ENEMY_FOLDER, filename)
-        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if img is not None:
-            img = cv2.resize(img, (120, 120))
-            enemy_images.append(img)
+def load_enemy_images():
+    images = []
+    for filename in sorted(os.listdir(config.ENEMY_FOLDER)):
+        if filename.lower().endswith((".png", ".jpg")):
+            img = load_image(os.path.join(config.ENEMY_FOLDER, filename), config.ENEMY_SIZE)
+            if img is not None:
+                images.append(img)
+    if not images:
+        sys.exit(f"No enemy images found in {config.ENEMY_FOLDER}")
+    return images
 
-cap = cv2.VideoCapture(0)
-cap.set(3, config.WINDOW_WIDTH)
-cap.set(4, config.WINDOW_HEIGHT)\
 
-cv2.namedWindow("PopShot AR", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("PopShot AR", config.WINDOW_WIDTH, config.WINDOW_HEIGHT)
+def open_camera():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        sys.exit("Couldn't open the webcam. Is it connected and not in use by another app?")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
+    ok, frame = cap.read()
+    if not ok:
+        cap.release()
+        sys.exit("The webcam opened but isn't sending any video.")
+    return cap, frame.shape[1], frame.shape[0]
 
-scoreboard_gui.run_scoreboard() 
 
-detector = HandDetector(detectionCon=0.8, trackCon=0.7)
-enemies = [Enemy(config.BASE_SPEED, enemy_images) for _ in range(3)]
+def new_wave(enemy_images, frame_w, frame_h):
+    # Space the starting enemies out so they don't arrive together.
+    gap = frame_h // config.ENEMY_COUNT
+    return [Enemy(config.BASE_SPEED, enemy_images, frame_w, frame_h, i * gap)
+            for i in range(config.ENEMY_COUNT)]
 
-database.init_db()
-high_name, high_score = database.get_high_score()
 
-score = 0
-lost = False
-lost_time = 0
+def window_closed():
+    try:
+        return cv2.getWindowProperty(config.WINDOW_TITLE, cv2.WND_PROP_VISIBLE) < 1
+    except cv2.error:
+        return True
 
-while True:
-    success, img = cap.read()
-    img = cv2.flip(img, 1)
 
-    if not lost:
-        img = detector.findHands(img, draw=False)
-        lmList = detector.findPosition(img, draw=True, finger_img=finger_img)
+def main():
+    database.init_db()
+    pop_sound = load_sound()
+    finger_img = load_image(config.FINGER_IMAGE, config.FINGER_SIZE)
+    enemy_images = load_enemy_images()
 
-        index_tip = None
-        for id, x, y in lmList:
-            if id == 8:
-                index_tip = (x, y)
+    cap, frame_w, frame_h = open_camera()
+    cv2.namedWindow(config.WINDOW_TITLE, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(config.WINDOW_TITLE, frame_w, frame_h)
+
+    scoreboard = Scoreboard()
+    detector = HandDetector()
+
+    state = PLAYING
+    score = 0
+    enemies = new_wave(enemy_images, frame_w, frame_h)
+    lost_time = 0.0
+    player_name = ""
+    failed_reads = 0
+    last_time = time.time()
+
+    try:
+        while not scoreboard.closed:
+            ok, img = cap.read()
+            if not ok:
+                failed_reads += 1
+                if failed_reads > MAX_FAILED_READS:
+                    print("Lost the webcam feed.")
+                    break
+                scoreboard.pump()
+                continue
+            failed_reads = 0
+            img = cv2.flip(img, 1)
+
+            now = time.time()
+            dt = min(now - last_time, 0.1)  # cap so a slow frame doesn't teleport enemies
+            last_time = now
+
+            if state == PLAYING:
+                tips = detector.find_index_tips(img)
+
+                for enemy in enemies[:]:
+                    enemy.move(dt)
+                    if any(enemy.is_popped(x, y) for x, y in tips):
+                        enemies.remove(enemy)
+                        score += 1
+                        speed = config.BASE_SPEED + (score // config.POPS_PER_LEVEL) * config.SPEED_STEP
+                        enemies.append(Enemy(speed, enemy_images, frame_w, frame_h))
+                        if pop_sound:
+                            pop_sound.play()
+                    elif enemy.escaped():
+                        state, lost_time = LOST, now
+
+                for enemy in enemies:
+                    enemy.draw(img)
+                if finger_img is not None:
+                    for x, y in tips:
+                        overlay_image(img, finger_img, x - config.FINGER_SIZE // 2,
+                                      y - config.FINGER_SIZE // 2)
+
+                draw_text(img, f"Score: {score}", (40, 70), 2, (255, 255, 255), 3)
+
+            elif state == LOST:
+                draw_text(img, "You Lost!", (frame_w // 2, frame_h // 2 - 40), 3, (0, 0, 255), 5, center=True)
+                draw_text(img, f"Score: {score}", (frame_w // 2, frame_h // 2 + 30), 1.5,
+                          (255, 255, 255), 3, center=True)
+                if now - lost_time > config.LOST_SCREEN_SECONDS:
+                    if database.makes_scoreboard(score):
+                        state, player_name = ENTER_NAME, ""
+                    else:
+                        state, score = PLAYING, 0
+                        enemies = new_wave(enemy_images, frame_w, frame_h)
+
+            elif state == ENTER_NAME:
+                cx, cy = frame_w // 2, frame_h // 2
+                draw_text(img, f"New top score: {score}!", (cx, cy - 80), 1.6, (0, 215, 255), 3, center=True)
+                draw_text(img, "Type your name:", (cx, cy - 20), 1.2, (255, 255, 255), 2, center=True)
+                cursor = "_" if int(now * 2) % 2 == 0 else " "
+                draw_text(img, player_name + cursor, (cx, cy + 50), 1.6, (255, 255, 255), 3, center=True)
+                draw_text(img, "Enter = save   Esc = skip", (cx, cy + 110), 0.9, (200, 200, 200), 2, center=True)
+
+            cv2.imshow(config.WINDOW_TITLE, img)
+            key = cv2.waitKey(1) & 0xFF
+
+            if state == ENTER_NAME:
+                if key == KEY_ENTER:
+                    database.add_score(player_name.strip() or "Player", score)
+                    scoreboard.refresh()
+                if key in (KEY_ENTER, KEY_ESC):
+                    state, score = PLAYING, 0
+                    enemies = new_wave(enemy_images, frame_w, frame_h)
+                    last_time = time.time()
+                elif key == KEY_BACKSPACE:
+                    player_name = player_name[:-1]
+                elif 32 <= key <= 126 and len(player_name) < config.MAX_NAME_LENGTH:
+                    player_name += chr(key)
+            elif key == KEY_ESC:
                 break
 
-        for enemy in enemies[:]:
-            enemy.move()
-            enemy.draw(img)
-
-            if index_tip and enemy.is_popped(index_tip[0], index_tip[1]):
-                enemies.remove(enemy)
-                score += 1
-                new_speed = config.BASE_SPEED + score // 5
-                enemies.append(Enemy(new_speed, enemy_images))
-                pop_sound.play()
-            elif enemy.y < -enemy.radius:
-                lost = True
-                lost_time = time.time()
+            if window_closed():
                 break
+            scoreboard.pump()
+    finally:
+        cap.release()
+        detector.close()
+        cv2.destroyAllWindows()
+        if not scoreboard.closed:
+            scoreboard.destroy()
+        pygame.mixer.quit()
 
-        cv2.putText(img, f"Score: {score}", (50, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 4)
 
-    else:
-        cv2.putText(img, "You Lost!", (300, 280),
-                    cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 0, 255), 5)
-
-        if score > high_score:
-            cv2.imshow("PopShot AR", img)
-            cv2.waitKey(2000)
-            cap.release()
-            cv2.destroyAllWindows()
-            player_name = input("New High Score! Enter your name: ")
-            database.update_high_score(player_name, score)
-            break
-
-        else:
-            cv2.putText(img, "Restarting...", (340, 320),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3)
-            if time.time() - lost_time > 2:
-                score = 0
-                enemies = [Enemy(config.BASE_SPEED, enemy_images) for _ in range(3)]
-                lost = False
-
-    cv2.imshow("PopShot AR", img)
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
-
-cap.release()
-cv2.destroyAllWindows()
-pygame.mixer.quit()
+if __name__ == "__main__":
+    main()
